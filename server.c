@@ -53,9 +53,9 @@ main()
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
+    addr.sin_family      = AF_INET;
     addr.sin_addr.s_addr = inet_addr("0.0.0.0");
-    addr.sin_port   = htons(PORT);
+    addr.sin_port        = htons(PORT);
 
     if (bind(sockfd, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
         printf("ipc bind failed\n");
@@ -102,10 +102,8 @@ main()
                 }
             }
 
-            int  id      = player_id++;
-            char buf[32] = { 0 };
-            sprintf(buf, "%d", id);
-            int n = write(clientfd, buf, strlen(buf));
+            int id = player_id++;
+            int n  = write(clientfd, (int32_t[]){ id }, sizeof(int32_t));
 
             // players
             struct player p = { .fd = clientfd, .id = id, .x = 0, .y = 0 };

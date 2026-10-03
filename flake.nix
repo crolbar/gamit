@@ -8,6 +8,7 @@
     devShells.${system}.default = pkgs.mkShell {
       packages = with pkgs; [
         raylib
+        curlFull
         pkg-config
       ];
     };

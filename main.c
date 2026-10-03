@@ -1,20 +1,19 @@
 #include "dll.h"
 #include "game.h"
-#include <arpa/inet.h>
-#include <netdb.h>
-
-#include <errno.h>
-#include <netinet/in.h>
 #include <raylib.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
+
+#include <curl/curl.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#define POLL(p, n, t) WSAPoll(p, n, t)
+#else
+#include <poll.h>
+#include <sys/select.h>
+#define POLL(p, n, t) poll(p, n, t)
+#endif
 
 #define SERVER_PORT "6767"
-#define SERVER_ADDR "localhost"
+#define SERVER_ADDR "gamit.crol.bar"
 
 #define PLAYER_WIDTH  50
 #define PLAYER_HEIGHT 50
@@ -47,108 +46,167 @@ DrawProjectile(int x, int y)
     DrawTriangle(v1, v2, v3, BEIGE);
 }
 
-int
+CURL*
 init_server_conn()
 {
-    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    CURL* curl = curl_easy_init();
 
-    struct addrinfo  req = { 0 };
-    struct addrinfo* pai;
+    curl_easy_setopt(curl, CURLOPT_URL, "wss://gamit.crol.bar");
+    curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 2L);
 
-    req.ai_family   = AF_INET;
-    req.ai_socktype = SOCK_STREAM;
-
-    int r = getaddrinfo(SERVER_ADDR, SERVER_PORT, &req, &pai);
-    if (r != 0)
-        goto fail;
-
-    if (connect(sockfd, pai->ai_addr, pai->ai_addrlen)) {
-
-        printf("failed to connect to socket at %s: %s\n",
-               "path TODO",
-               strerror(errno));
-        close(sockfd);
+    CURLcode rc = curl_easy_perform(curl);
+    if (rc != CURLE_OK) {
+        fprintf(stderr, "connect failed: %s\n", curl_easy_strerror(rc));
         goto fail;
     }
 
-    printf("Connected to %s (%s:%s)\n",
-           SERVER_ADDR,
-           inet_ntoa(((struct sockaddr_in*)pai->ai_addr)->sin_addr),
-           SERVER_PORT);
+    printf("Connected to %s:%s\n", SERVER_ADDR, SERVER_PORT);
 
-    return sockfd;
+    return curl;
 fail:
-    return -1;
+    return NULL;
 }
 
 int
-read_possible_from_server(int fd)
+send_ws_msg_d(CURL* curl, int32_t* data, size_t data_len)
+{
+    size_t body_size = sizeof(int32_t) * data_len;
+
+    size_t   sent;
+    CURLcode rc = curl_ws_send(curl,
+                               (uint32_t[]){ MSG_DATA, body_size },
+                               sizeof(uint32_t) * 2,
+                               &sent,
+                               0,
+                               CURLWS_BINARY);
+    if (rc != CURLE_OK) {
+        printf("send: %s\n", curl_easy_strerror(rc));
+        return 1;
+    }
+
+    rc = curl_ws_send(curl, data, body_size, &sent, 0, CURLWS_BINARY);
+    if (rc != CURLE_OK) {
+        printf("send: %s\n", curl_easy_strerror(rc));
+        return 1;
+    }
+
+    return 0;
+}
+
+static int
+ws_read(CURL* c, void* buf, size_t n, int block)
+{
+    curl_socket_t s;
+    curl_easy_getinfo(c, CURLINFO_ACTIVESOCKET, &s);
+    struct pollfd p = { .fd = s, .events = POLLIN };
+
+    if (!block && poll(&p, 1, 0) <= 0)
+        return 0;
+
+    size_t total = 0;
+    while (total < n) {
+        size_t                      got = 0;
+        const struct curl_ws_frame* m;
+        CURLcode rc = curl_ws_recv(c, (char*)buf + total, n - total, &got, &m);
+
+        if (rc == CURLE_AGAIN) {
+            if (total == 0 && !block)
+                return 0;
+            poll(&p, 1, 10);
+            continue;
+        }
+        if (rc != CURLE_OK || (m->flags & CURLWS_CLOSE))
+            return -1;
+        if (m->flags & (CURLWS_PING | CURLWS_PONG))
+            continue;
+        total += got;
+    }
+    return 1;
+}
+
+static ssize_t
+ws_recv(CURL* c, void* buf, size_t n)
+{
+    size_t                      got = 0;
+    const struct curl_ws_frame* m;
+    CURLcode                    rc = curl_ws_recv(c, buf, n, &got, &m);
+
+    if (rc == CURLE_AGAIN)
+        return 0;
+    if (rc != CURLE_OK || (m->flags & CURLWS_CLOSE))
+        return -1;
+    if (m->flags & (CURLWS_PING | CURLWS_PONG))
+        return 0;
+    return (ssize_t)got;
+}
+
+int
+read_possible_from_server(CURL* curl)
 {
 
     int r = 0;
 
-    do {
-        struct pollfd* pfd =
-          (struct pollfd[]){ { .fd = fd, .events = POLLIN } };
-        r = poll(pfd, 1, 0);
-        if (r > 0 && pfd[0].revents & POLLIN) {
-            uint32_t msg_head[2] = { 0 };
-            ssize_t  n           = recv(fd, msg_head, sizeof(uint32_t) * 2, 0);
-            if (n <= 0) {
+    // do {
+
+    uint32_t msg_head[2] = { 0 };
+    r                    = ws_recv(curl, msg_head, sizeof(uint32_t) * 2);
+    if (r < 0)
+        return 1;
+    if (r > 0) {
+        if (msg_head[0] == MSG_DATA) {
+            int32_t buf[msg_head[1]];
+            memset(buf, 0, msg_head[1]);
+            if (ws_read(curl, buf, msg_head[1], 1) < 0) {
                 return 1;
             }
+            // for (int i = 0; buf[i] != -1; i++) {
+            //     printf("r: %d ", buf[i]);
+            // }
+            // printf("\n");
 
-            if (msg_head[0] == MSG_DATA) {
-                int32_t buf[msg_head[1]];
-                memset(buf, 0, msg_head[1]);
-                n = recv(fd, buf, msg_head[1], 0);
-                if (n <= 0) {
-                    return 1;
-                }
+            int pid = -1;
 
-                int pid = -1;
+            for (int i = 0; buf[i] != -1; i++) {
+                if (buf[i] == MSG_PLAYER_ID) {
+                    pid = buf[i + 1];
 
-                for (int i = 0; buf[i] != -1; i++) {
-                    if (buf[i] == MSG_PLAYER_ID) {
-                        pid = buf[i + 1];
-
-                        int new_player = 1;
-                        dll_for_each(players, v)
-                        {
-                            if (pid != v->val.id)
-                                continue;
-                            new_player = 0;
-                            break;
-                        }
-
-                        if (new_player) {
-                            struct player p =
-                              (struct player){ .id = pid, .x = 0, .y = 0 };
-                            dll_push_tail(players, p)
-                        }
-
-                        i += 1;
-                    } else if (buf[i] == MSG_PLAYER_POS) {
-                        if (pid == -1) {
-                            printf("requested pos up, with no id provided\n");
+                    int new_player = 1;
+                    dll_for_each(players, v)
+                    {
+                        if (pid != v->val.id)
                             continue;
-                        }
-
-                        dll_for_each(players, v)
-                        {
-                            if (pid != v->val.id)
-                                continue;
-
-                            v->val.x = buf[i + 1];
-                            v->val.y = buf[i + 2];
-                        }
-
-                        i += 2;
+                        new_player = 0;
+                        break;
                     }
+
+                    if (new_player) {
+                        struct player p =
+                          (struct player){ .id = pid, .x = 0, .y = 0 };
+                        dll_push_tail(players, p)
+                    }
+
+                    i += 1;
+                } else if (buf[i] == MSG_PLAYER_POS) {
+                    if (pid == -1) {
+                        printf("requested pos up, with no id provided\n");
+                        continue;
+                    }
+
+                    dll_for_each(players, v)
+                    {
+                        if (pid != v->val.id)
+                            continue;
+
+                        v->val.x = buf[i + 1];
+                        v->val.y = buf[i + 2];
+                    }
+
+                    i += 2;
                 }
             }
         }
-    } while (r > 0);
+    }
 
     return 0;
 }
@@ -162,15 +220,17 @@ main()
     InitWindow(800, 600, "torta");
     // MaximizeWindow();
 
-    int server_fd = init_server_conn();
-    if (server_fd == -1) {
+    CURL* curl = init_server_conn();
+    if (!curl) {
         printf("failed to connect to server\n");
         return 1;
     }
 
-    char id[32]  = { 0 };
-    int  n       = read(server_fd, id, sizeof(id));
-    int  _int_id = atoi(id);
+    int32_t id_buf[1] = { 0 };
+    int     n         = ws_read(curl, id_buf, sizeof(int32_t), 1);
+    char    id[32]    = { 0 };
+    int     _int_id   = id_buf[0];
+    sprintf(id, "%d", _int_id);
     printf("player id: %s\n", id);
 
     int shouldOpenInventar = 0;
@@ -201,8 +261,8 @@ main()
 
         // update
         {
-            if (read_possible_from_server(server_fd)) {
-                printf("closed server conn");
+            if (read_possible_from_server(curl)) {
+                printf("closed server conn\n");
                 break;
             }
 
@@ -238,7 +298,7 @@ main()
             }
 
             if (IsKeyPressed(KEY_S)) {
-                send_msg_s(server_fd, "s pressed");
+                // send_msg_s(curl, "s pressed");
             }
 
             if (IsKeyDown(KEY_SPACE)) {
@@ -269,8 +329,8 @@ main()
 
             // player moved, send to server
             if (_ipx != pX || _ipy != pY) {
-                send_msg_d(
-                  server_fd,
+                send_ws_msg_d(
+                  curl,
                   (int32_t[]){
                     MSG_PLAYER_ID, _int_id, MSG_PLAYER_POS, pX, pY, -1 },
                   6);

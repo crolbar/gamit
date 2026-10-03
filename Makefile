@@ -1,4 +1,4 @@
-DEPS = raylib
+DEPS = raylib libcurl
 CFLAGGS_DEPS = $(shell pkg-config --cflags $(DEPS))
 LDLIBS += $(shell pkg-config --libs $(DEPS))
 
