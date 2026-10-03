@@ -16,37 +16,46 @@
         ];
     });
 
-curlStatic = (cross.curl.override {
-  websocketSupport = true;
-  opensslSupport = false;
-  zlibSupport = true;
-  http2Support = false;
-  http3Support = false;
-  brotliSupport = false;
-  zstdSupport = false;
-  scpSupport = false;
-  gssSupport = false;
-  idnSupport = false;
-  pslSupport = false;
-}).overrideAttrs (old: {
-  configureFlags =
-    (builtins.filter (f: f != "--without-ssl") (old.configureFlags or []))
-    ++ [
-      "--disable-shared"
-      "--enable-static"
-      "--with-schannel"
-    ];
-});
-
-  in {	
-    devShells.${system}.default = cross.mkShell {
-      nativeBuildInputs = with pkgs; [
-       pkg-config
-      ];
-      buildInputs = [
-	curlStatic 
-	raylibStatic
-      ];
+    curlStatic =
+      (cross.curl.override {
+        websocketSupport = true;
+        opensslSupport = false;
+        zlibSupport = true;
+        http2Support = false;
+        http3Support = false;
+        brotliSupport = false;
+        zstdSupport = false;
+        scpSupport = false;
+        gssSupport = false;
+        idnSupport = false;
+        pslSupport = false;
+      }).overrideAttrs (old: {
+        configureFlags =
+          (builtins.filter (f: f != "--without-ssl") (old.configureFlags or []))
+          ++ [
+            "--disable-shared"
+            "--enable-static"
+            "--with-schannel"
+          ];
+      });
+  in {
+    devShells.${system} = {
+      default = pkgs.mkShell {
+        packages = with pkgs; [
+          pkg-config
+          curlFull
+          raylib
+        ];
+      };
+      win = cross.mkShell {
+        nativeBuildInputs = with pkgs; [
+          pkg-config
+        ];
+        buildInputs = [
+          curlStatic
+          raylibStatic
+        ];
+      };
     };
   };
 }
