@@ -1,5 +1,8 @@
 #include "dll.h"
 #include "game.h"
+#include <arpa/inet.h>
+#include <netdb.h>
+
 #include <errno.h>
 #include <netinet/in.h>
 #include <raylib.h>
@@ -10,7 +13,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define SERVER_PORT 6767
+#define SERVER_PORT "6767"
+#define SERVER_ADDR "localhost"
 
 #define PLAYER_WIDTH  50
 #define PLAYER_HEIGHT 50
@@ -48,17 +52,30 @@ init_server_conn()
 {
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
 
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port   = htons(SERVER_PORT);
-    if (connect(sockfd, (struct sockaddr*)&addr, sizeof(struct sockaddr_in))) {
+    struct addrinfo  req = { 0 };
+    struct addrinfo* pai;
+
+    req.ai_family   = AF_INET;
+    req.ai_socktype = SOCK_STREAM;
+
+    int r = getaddrinfo(SERVER_ADDR, SERVER_PORT, &req, &pai);
+    if (r != 0)
+        goto fail;
+
+    if (connect(sockfd, pai->ai_addr, pai->ai_addrlen)) {
 
         printf("failed to connect to socket at %s: %s\n",
                "path TODO",
                strerror(errno));
         close(sockfd);
+        goto fail;
     }
+
+    printf("Connected to %s (%s:%s)\n",
+           SERVER_ADDR,
+           inet_ntoa(((struct sockaddr_in*)pai->ai_addr)->sin_addr),
+           SERVER_PORT);
+
     return sockfd;
 fail:
     return -1;
@@ -139,17 +156,17 @@ read_possible_from_server(int fd)
 int
 main()
 {
-    int server_fd = init_server_conn();
-    if (server_fd == -1) {
-        printf("failed to connect to server\n");
-        return 1;
-    }
-
     SetConfigFlags(FLAG_WINDOW_RESIZABLE);
     SetTargetFPS(1000);
 
     InitWindow(800, 600, "torta");
     // MaximizeWindow();
+
+    int server_fd = init_server_conn();
+    if (server_fd == -1) {
+        printf("failed to connect to server\n");
+        return 1;
+    }
 
     char id[32]  = { 0 };
     int  n       = read(server_fd, id, sizeof(id));

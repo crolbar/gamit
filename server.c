@@ -1,4 +1,5 @@
 #include "dll.h"
+#include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -53,6 +54,7 @@ main()
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = inet_addr("0.0.0.0");
     addr.sin_port   = htons(PORT);
 
     if (bind(sockfd, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
