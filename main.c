@@ -1,18 +1,42 @@
 #include "dll.h"
 #include "game.h"
+
 #include <errno.h>
-#include <raylib.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+#include <time.h>
+
+#ifdef _WIN32
+/*
+ * curl.h pulls in winsock2.h -> windows.h, which declares functions with the
+ * same names as raylib's (Rectangle, CloseWindow, ShowCursor, DrawText, ...).
+ * So: include the windows headers FIRST, with the clashing names renamed (or
+ * undefined again afterwards), and only then include raylib.h.
+ */
+#define WIN32_LEAN_AND_MEAN
+#define Rectangle   WinRectangle
+#define CloseWindow WinCloseWindow
+#define ShowCursor  WinShowCursor
+#endif
 
 #include <curl/curl.h>
-#include <unistd.h>
+
 #ifdef _WIN32
-#include <winsock2.h>
-#define POLL(p, n, t) WSAPoll(p, n, t)
+#undef Rectangle
+#undef CloseWindow
+#undef ShowCursor
+#undef DrawText
+#undef DrawTextEx
+#undef LoadImage
+#undef PlaySound
 #else
 #include <poll.h>
-#include <sys/select.h>
-#define POLL(p, n, t) poll(p, n, t)
 #endif
+
+#include <raylib.h>
 
 #define SERVER_PORT "6767"
 #define SERVER_ADDR "gamit.crol.bar"
@@ -32,7 +56,7 @@ DrawPlayer(int x, int y, int id)
 {
     if (id) {
         char buf[32] = { 0 };
-        sprintf(buf, "%d", id);
+        snprintf(buf, sizeof(buf), "%d", id);
         DrawText(buf, x, y - 30, 30, GREEN);
     }
     DrawRectangle(x, y, PLAYER_WIDTH, PLAYER_HEIGHT, RED);
@@ -53,9 +77,35 @@ DrawProjectile(int x, int y)
 uint64_t
 time_get_now_usec()
 {
+#ifdef _WIN32
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER        now;
+    if (freq.QuadPart == 0)
+        QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    return (uint64_t)(now.QuadPart * 1000000ULL / (uint64_t)freq.QuadPart);
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+#endif
+}
+
+/* Block until the socket is readable. Returns <0 on error. */
+static int
+wait_readable(curl_socket_t s)
+{
+#ifdef _WIN32
+    WSAPOLLFD p = { .fd = s, .events = POLLRDNORM };
+    return WSAPoll(&p, 1, -1);
+#else
+    struct pollfd p = { .fd = s, .events = POLLIN };
+    int           pr;
+    do {
+        pr = poll(&p, 1, -1);
+    } while (pr < 0 && errno == EINTR);
+    return pr;
+#endif
 }
 
 CURL*
@@ -130,13 +180,7 @@ ws_read(CURL* c, void* buf, size_t n, int block)
                 return -1;
             }
 
-            struct pollfd p = { .fd = s, .events = POLLIN };
-            int           pr;
-            do {
-                pr = poll(&p, 1, -1); /* sleep until readable */
-            } while (pr < 0 && errno == EINTR);
-
-            if (pr < 0)
+            if (wait_readable(s) < 0) /* sleep until readable */
                 return -1;
             continue;
         }
@@ -162,12 +206,12 @@ static ssize_t
 ws_recv(CURL* c, void* buf, size_t n)
 {
     size_t                      got = 0;
-    const struct curl_ws_frame* m;
-    CURLcode                    rc = curl_ws_recv(c, buf, n, &got, &m);
+    const struct curl_ws_frame* m   = NULL;
+    CURLcode                    rc  = curl_ws_recv(c, buf, n, &got, &m);
 
     if (rc == CURLE_AGAIN)
         return 0;
-    if (rc != CURLE_OK || (m->flags & CURLWS_CLOSE))
+    if (rc != CURLE_OK || m == NULL || (m->flags & CURLWS_CLOSE))
         return -1;
     if (m->flags & (CURLWS_PING | CURLWS_PONG))
         return 0;
@@ -267,10 +311,10 @@ main()
     }
 
     int32_t id_buf[1] = { 0 };
-    int     n         = ws_read(curl, id_buf, sizeof(int32_t), 1);
-    char    id[32]    = { 0 };
-    int     _int_id   = id_buf[0];
-    sprintf(id, "%d", _int_id);
+    ws_read(curl, id_buf, sizeof(int32_t), 1);
+    char id[32]  = { 0 };
+    int  _int_id = id_buf[0];
+    snprintf(id, sizeof(id), "%d", _int_id);
     printf("player id: %s\n", id);
 
     int shouldOpenInventar = 0;

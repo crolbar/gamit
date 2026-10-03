@@ -1,6 +1,6 @@
 DEPS = raylib libcurl
-CFLAGGS_DEPS = $(shell pkg-config --cflags $(DEPS))
-LDLIBS += $(shell pkg-config --libs $(DEPS))
+CFLAGGS_DEPS = $(shell pkg-config --cflags $(DEPS)) -DCURL_STATICLIB
+LDLIBS += $(shell pkg-config --libs --static $(DEPS)) -lopengl32 -lgdi32 -lwinmm
 
 SRC = main.c
 SRC_SERVER = server.c
@@ -8,9 +8,13 @@ SRC_SERVER = server.c
 BINS = gamit gamit-server
 
 all: $(BINS)
+win: gamit.exe
 
 gamit: $(SRC)
 	$(CC) $(CFLAGS) $(CFLAGGS_DEPS) -o $@ $(SRC) $(LDLIBS)
+
+gamit.exe: $(SRC)
+	$(CC) $(CFLAGS) $(CFLAGGS_DEPS) -o $@ -static $(SRC) $(LDLIBS)
 
 gamit-server: $(SRC)
 	$(CC) $(CFLAGS) $(CFLAGGS_DEPS) -o $@ $(SRC_SERVER) $(LDLIBS)
@@ -19,4 +23,4 @@ gamit-server: $(SRC)
 run: $(BINS)
 	./run.sh
 
-.PHONY: all $(BINS)
+.PHONY: all $(BINS) win gamit.exe
