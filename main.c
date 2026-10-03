@@ -1,8 +1,10 @@
 #include "dll.h"
 #include "game.h"
+#include <errno.h>
 #include <raylib.h>
 
 #include <curl/curl.h>
+#include <unistd.h>
 #ifdef _WIN32
 #include <winsock2.h>
 #define POLL(p, n, t) WSAPoll(p, n, t)
@@ -20,6 +22,8 @@
 #define PLAYER_SPEED  5
 #define PROJ_SIZE     100
 #define PROJ_SPEED    5
+
+#define PLAYER_POS_UPDATE_DELAY_MS 50
 
 static dll(struct player) players;
 
@@ -44,6 +48,14 @@ DrawProjectile(int x, int y)
     Vector2 v3 = { x + size, y + 0 };
 
     DrawTriangle(v1, v2, v3, BEIGE);
+}
+
+uint64_t
+time_get_now_usec()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
 
 CURL*
@@ -94,35 +106,56 @@ send_ws_msg_d(CURL* curl, int32_t* data, size_t data_len)
     return 0;
 }
 
-static int
+static ssize_t
 ws_read(CURL* c, void* buf, size_t n, int block)
 {
-    curl_socket_t s;
-    curl_easy_getinfo(c, CURLINFO_ACTIVESOCKET, &s);
-    struct pollfd p = { .fd = s, .events = POLLIN };
-
-    if (!block && poll(&p, 1, 0) <= 0)
+    if (n == 0)
         return 0;
 
-    size_t total = 0;
-    while (total < n) {
+    for (;;) {
         size_t                      got = 0;
-        const struct curl_ws_frame* m;
-        CURLcode rc = curl_ws_recv(c, (char*)buf + total, n - total, &got, &m);
+        const struct curl_ws_frame* m   = NULL;
+        CURLcode                    rc  = curl_ws_recv(c, buf, n, &got, &m);
 
         if (rc == CURLE_AGAIN) {
-            if (total == 0 && !block)
-                return 0;
-            poll(&p, 1, 10);
+            if (!block) {
+                errno = EAGAIN;
+                return -1;
+            }
+
+            curl_socket_t s;
+            if (curl_easy_getinfo(c, CURLINFO_ACTIVESOCKET, &s) != CURLE_OK ||
+                s == CURL_SOCKET_BAD) {
+                errno = EBADF;
+                return -1;
+            }
+
+            struct pollfd p = { .fd = s, .events = POLLIN };
+            int           pr;
+            do {
+                pr = poll(&p, 1, -1); /* sleep until readable */
+            } while (pr < 0 && errno == EINTR);
+
+            if (pr < 0)
+                return -1;
             continue;
         }
-        if (rc != CURLE_OK || (m->flags & CURLWS_CLOSE))
+
+        if (rc == CURLE_GOT_NOTHING) /* peer closed the connection */
+            return 0;
+        if (rc != CURLE_OK || m == NULL) {
+            errno = EIO;
             return -1;
+        }
+        if (m->flags & CURLWS_CLOSE)
+            return 0;
         if (m->flags & (CURLWS_PING | CURLWS_PONG))
-            continue;
-        total += got;
+            continue; /* control frame, not user data */
+        if (got == 0)
+            continue; /* empty data frame */
+
+        return (ssize_t)got;
     }
-    return 1;
 }
 
 static ssize_t
@@ -144,16 +177,15 @@ ws_recv(CURL* c, void* buf, size_t n)
 int
 read_possible_from_server(CURL* curl)
 {
-
     int r = 0;
+    do {
+        uint32_t msg_head[2] = { 0 };
+        r                    = ws_recv(curl, msg_head, sizeof(uint32_t) * 2);
+        if (r < 0)
+            return 1;
+        if (r == 0)
+            break;
 
-    // do {
-
-    uint32_t msg_head[2] = { 0 };
-    r                    = ws_recv(curl, msg_head, sizeof(uint32_t) * 2);
-    if (r < 0)
-        return 1;
-    if (r > 0) {
         if (msg_head[0] == MSG_DATA) {
             int32_t buf[msg_head[1]];
             memset(buf, 0, msg_head[1]);
@@ -206,8 +238,16 @@ read_possible_from_server(CURL* curl)
                 }
             }
         }
-    }
+    } while (r > 0);
 
+    return 0;
+}
+
+int
+send_pos_update(CURL* curl, int id, int pX, int pY)
+{
+    send_ws_msg_d(
+      curl, (int32_t[]){ MSG_PLAYER_ID, id, MSG_PLAYER_POS, pX, pY, -1 }, 6);
     return 0;
 }
 
@@ -237,30 +277,31 @@ main()
     int pX                 = 0;
     int pY                 = 0;
 
-    int isProjSpawned = 0;
-    int projX         = 0;
-    int projY         = 0;
-    players           = (typeof(players))dll_init();
+    int isProjSpawned      = 0;
+    int projX              = 0;
+    int projY              = 0;
+    players                = (typeof(players))dll_init();
+    uint64_t lastPosUpdate = time_get_now_usec();
+    int      posHasChanged = 0;
 
     int width  = GetRenderWidth();
     int height = GetRenderHeight();
     printf("w: %d, h: %d\n", width, height);
     while (!WindowShouldClose()) {
-        if (IsWindowResized()) {
-            width  = GetRenderWidth();
-            height = GetRenderHeight();
-            printf("w: %d, h: %d\n", width, height);
-        }
-
-        BeginDrawing();
-
-        ClearBackground(RAYWHITE);
-
         int _ipx = pX;
         int _ipy = pY;
 
         // update
         {
+            uint64_t n = time_get_now_usec();
+            // every 800 ms send up
+            if (n - lastPosUpdate > PLAYER_POS_UPDATE_DELAY_MS * 1000 &&
+                posHasChanged) {
+                send_pos_update(curl, _int_id, pX, pY);
+                lastPosUpdate = n;
+                posHasChanged = 0;
+            }
+
             if (read_possible_from_server(curl)) {
                 printf("closed server conn\n");
                 break;
@@ -329,13 +370,25 @@ main()
 
             // player moved, send to server
             if (_ipx != pX || _ipy != pY) {
-                send_ws_msg_d(
-                  curl,
-                  (int32_t[]){
-                    MSG_PLAYER_ID, _int_id, MSG_PLAYER_POS, pX, pY, -1 },
-                  6);
+                uint64_t n = time_get_now_usec();
+                if (n - lastPosUpdate > PLAYER_POS_UPDATE_DELAY_MS * 1000) {
+                    send_pos_update(curl, _int_id, pX, pY);
+                    lastPosUpdate = n;
+                    posHasChanged = 0;
+                }
+                posHasChanged = 1;
             }
         }
+
+        if (IsWindowResized()) {
+            width  = GetRenderWidth();
+            height = GetRenderHeight();
+            printf("w: %d, h: %d\n", width, height);
+        }
+
+        BeginDrawing();
+
+        ClearBackground(RAYWHITE);
 
         DrawPlayer(pX, pY, 0);
 
@@ -364,6 +417,7 @@ main()
         }
 
         EndDrawing();
+        // usleep(1 * 1000);
     }
 
     CloseWindow();
